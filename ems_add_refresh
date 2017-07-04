@@ -1,0 +1,233 @@
+#!/bin/bash
+
+###
+# TODO Detect execution environment and configure Provider_IP / Provider_Passwd appropriately
+###
+
+OPTIND=1
+TEST_NAME="ems_add_refresh"
+VMDB="/var/www/miq/vmdb"
+RESULTS_ROOT="/data"
+PROVIDER=vmware
+
+Appliance_IP="unknown"
+Provider_Size="unknown"
+ProviderType="vmware"
+ProviderAdd=60
+ProviderRefresh=180
+TestEnd=300
+AppVersion="unknown"
+WorkerConfig="unknown"
+
+PidList=/tmp/pidlist.txt
+SmemOutput=/tmp/smem.out
+
+
+while getopts "h?i:s:p:a:r:e:v:w:" opt; do
+    case "$opt" in
+    h) echo "usage: ems_add_refresh -i appliance_ip -p [vmware/openshift] -w [default/single] -s [small/medium/large/xlarge] -a provider_add_time -r provider_refresh_time -e test_end_time -v version"
+       exit 0
+       ;;	
+    s) Provider_Size="${OPTARG}"
+       case "${Provider_Size}" in
+       "small"|"Small")
+           Provider_IP=10.8.99.224
+           Provider_Passwd="L0ck3dout!"
+           ;;
+       "medium"|"Medium")
+           Provider_IP=10.8.99.247
+           Provider_Passwd="Unl0ck4Root!"
+           ;;
+       "large"|"Large")
+           Provider_IP=10.8.99.220
+           Provider_Passwd="Unl0ck4CFME!"
+           ;;
+       "xlarge"|"XLarge")
+           Provider_IP=10.8.99.166
+           Provider_Passwd="vmware"
+           ;;
+       esac
+       ;;
+    i) Appliance_IP=${OPTARG} ;; 
+    a) ProviderAdd=${OPTARG} ;;
+    r) ProviderRefresh=${OPTARG} ;;
+    e) TestEnd=${OPTARG} ;;
+    v) AppVersion="${OPTARG}" ;;
+    p) ProviderType="vmware" ;;
+    w) WorkerConfig="${OPTARG}" ;;
+    esac
+done
+
+if [ "${Appliance_IP}" == "unknown" -o "${Provider_Size}" == "unknown" -o "${WorkerConfig}" == "unknown" ]
+then
+    echo "usage: ems_add_refresh -i appliance_ip -p [vmware/openshift] -w [default/single] -s [small/medium/large/xlarge] -a provider_add_time -r provider_refresh_time -e test_end_time -v version"
+    exit 1
+fi
+
+if [ "${AppVersion}" == "unknown" ]
+then
+    AppVersion=`ssh root@${Appliance_IP} "cat ${VMDB}/VERSION"`
+fi
+
+if [ "${AppVersion}" == "master" ]
+then
+  echo "Testing and MIQ appliance, you must specify version with -v"
+  exit 1
+fi
+
+dbIPconfig=`ssh root@${Appliance_IP} grep host: /var/www/miq/vmdb/config/database.yml`
+if [ "${dbIPconfig}" == "" ]
+then
+  DbType=localdb
+  dbIP="localhost"
+else
+  DbType=remotedb
+  dbIP=`echo ${dbIPconfig} | cut -d':' -f2 | sed -e 's/ //g'`
+fi
+
+LocalHostDb=`ssh root@${Appliance_IP} grep -c host: /var/www/miq/vmdb/config/database.yml`
+if [ "${LocalHostDb}" == '0' ]
+then
+  DbType=localdb
+else
+  DbType=remotedb
+fi
+
+RESULTS_FOLDER="${RESULTS_ROOT}/${TEST_NAME}/${ProviderType}/${Provider_Size}/${DbType}/${WorkerConfig}/${AppVersion}"
+
+if [ -d "${RESULTS_FOLDER}" ]
+then
+    echo "error: results folder ${RESULTS_FOLDER} exists"
+    exit 1
+else
+    mkdir -p "${RESULTS_FOLDER}"
+    echo "`date +%H:%M:%S`: EMS_ADD_REFRESH Test Started" | tee -a ${RESULTS_FOLDER}/event_times.txt
+fi
+
+###
+# Create the memory data directories
+###
+SmemData="${RESULTS_FOLDER}/smem.d"
+mkdir -p "${SmemData}"
+FreeData="${RESULTS_FOLDER}/free.d"
+mkdir -p ${FreeData}
+
+###
+# Record Provider Information
+###
+echo "Provider IP:     ${Provider_IP}" >${RESULTS_FOLDER}/ProviderInfo.txt
+echo "Provider Passwd: ${Provider_Passwd}" >>${RESULTS_FOLDER}/ProviderInfo.txt
+echo "Provider Size:   ${Provider_Size}" >>${RESULTS_FOLDER}/ProviderInfo.txt
+
+###
+# Record test hardware information
+###
+lscpu >${RESULTS_FOLDER}/cpuInfo.txt
+
+###
+# Collect Version and Database Config from the test appliance
+###
+scp root@${Appliance_IP}:/var/www/miq/vmdb/VERSION ${RESULTS_FOLDER}
+scp root@${Appliance_IP}:/var/www/miq/vmdb/config/database.yml ${RESULTS_FOLDER}
+
+dbIP=`grep host: ${RESULTS_FOLDER}/database.yml | cut -d':' -f2 | sed -e 's/ //g'`
+if [ "${dbIP}" == "" ]
+then
+  dbIP=localhost
+fi
+
+### DEBUG ###
+echo "dpIP: ${dbIP}"
+### DEBUG ###
+
+###
+# Collect information from the test appliance
+###
+ssh root@${Appliance_IP} "cd /var/www/miq/vmdb; bundle show" >${RESULTS_FOLDER}/bundle.out
+ssh root@${Appliance_IP} uptime >${RESULTS_FOLDER}/uptime_at_start.txt
+ssh root@${Appliance_IP} ps auxf >${RESULTS_FOLDER}/ps-start.txt
+
+###
+# Record DB latency
+###
+ssh root@${Appliance_IP} ping -c 5 ${dbIP} >${RESULTS_FOLDER}/db_ping.out
+
+scp ~/bin/smem root@${Appliance_IP}:
+scp ~/bin/capture_smem root@${Appliance_IP}:
+
+ssh root@${Appliance_IP} "echo EMD_ADD_REFRESH: TEST STARTING @ ${T} >>/var/www/miq/vmdb/log/evm.log"
+
+Count=1
+while [ true ]
+do
+
+    if [ $((Count % 5)) -eq 0 ]
+    then
+        ssh root@${Appliance_IP} ping -c 5 ${dbIP} >>${RESULTS_FOLDER}/db_ping.out
+    fi
+
+    T=`date +%C%y%m%d_%H%M%S`
+
+    echo -e "${T}: Capturing Quantum [${Count} of ${TestEnd}] \c"
+    ssh root@${Appliance_IP} ./capture_smem >${SmemData}/smem.${T}
+    ssh root@${Appliance_IP} free >${FreeData}/free.${T}
+    echo ", complete"
+
+    if [ ${Count} -eq ${ProviderAdd} ]
+    then
+        ###
+        # Add Provider
+        ###
+        echo "e = ExtManagementSystem.first" >${RESULTS_FOLDER}/emsadd.rb
+        echo "e = ManageIQ::Providers::InfraManager.create(:name => \"Vmware${Provider_Size}\", :hostname => \"${Provider_IP}\", :type => \"ManageIQ::Providers::Vmware::InfraManager\", :zone => Zone.default_zone)" >>${RESULTS_FOLDER}/emsadd.rb
+        echo "e.update_authentication(:default => {:userid => \"root\", :password => \"${Provider_Passwd}\"})" >>${RESULTS_FOLDER}/emsadd.rb
+        echo "e.authentication_check" >>${RESULTS_FOLDER}/emsadd.rb
+        echo "print \"Vmware${Provider_Size} Added\n\"" >>${RESULTS_FOLDER}/emsadd.rb
+        echo "exit 0" >>${RESULTS_FOLDER}/emsadd.rb
+
+        scp ${RESULTS_FOLDER}/emsadd.rb root@${Appliance_IP}:/var/www/miq/vmdb
+
+        echo "${T}: Provider Add Starting" | tee -a ${RESULTS_FOLDER}/event_times.txt
+
+	      ssh root@${Appliance_IP} "echo EMD_ADD_REFRESH: PROVIDER ADD STARTING @ ${T} >>/var/www/miq/vmdb/log/evm.log"
+        ssh root@${Appliance_IP} "cd /var/www/miq/vmdb; bin/rails runner ./emsadd.rb; rm -f emsadd.rb"
+
+    elif [ ${Count} -eq ${ProviderRefresh} ]
+    then
+        ###
+        # Provider Refresh
+        ###
+        echo "EmsRefresh.refresh(ExtManagementSystem.first)" ${RESULTS_FOLDER}/>emsrefresh.rb
+        echo "print \"EMS Refresh Complete\n\"" >>${RESULTS_FOLDER}/emsrefresh.rb
+        echo "exit 0" >>${RESULTS_FOLDER}/emsrefresh.rb
+
+        scp ${RESULTS_FOLDER}/emsrefresh.rb root@${Appliance_IP}:/var/www/miq/vmdb
+
+        echo "${T}: Provider Refresh Starting" | tee -a ${RESULTS_FOLDER}/event_times.txt
+
+	      ssh root@${Appliance_IP} "echo EMD_ADD_REFRESH: PROVIDER REFRESH STARTING @ ${T} >>/var/www/miq/vmdb/log/evm.log"
+        ssh root@${Appliance_IP} "cd /var/www/miq/vmdb; bin/rails runner ./emsrefresh.rb; rm -f emsrefresh.rb"
+
+    elif [ ${Count} -eq ${TestEnd} ]
+    then
+        break
+    fi
+
+    sleep 60
+    Count=$((Count + 1))
+
+done
+
+ssh root@${Appliance_IP} "rm -f smem capture_smem"
+
+echo "Capturing Logs"
+scp -r root@${Appliance_IP}:/var/www/miq/vmdb/log ${RESULTS_FOLDER}
+
+T=`date +%C%y%m%d_%H%M%S`
+echo "${T}: EMS_ADD_REFRESH Test Complete" >> ${RESULTS_FOLDER}/event_times.txt
+
+scp -r root@${Appliance_IP}:/var/www/miq/vmdb/log .
+
+echo "${T}: EMS_ADD_REFRESH Test Complete"
+
+exit 0
